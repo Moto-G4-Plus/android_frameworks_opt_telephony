@@ -52,6 +52,7 @@ import android.telephony.UiccAccessRule;
 import android.telephony.UiccSlotInfo;
 import android.telephony.euicc.EuiccManager;
 import android.text.TextUtils;
+import android.util.EventLog;
 import android.util.LocalLog;
 import android.util.Log;
 
@@ -283,7 +284,7 @@ public class SubscriptionController extends ISub.Stub {
         mContext.enforceCallingOrSelfPermission(
                 Manifest.permission.READ_PRIVILEGED_PHONE_STATE, message);
     }
-    
+
     /**
      * Returns whether the {@code callingPackage} has access to subscriber identifiers on the
      * specified {@code subId} using the provided {@code message} in any resulting
@@ -665,11 +666,11 @@ public class SubscriptionController extends ISub.Stub {
                         logd("[getActiveSubscriptionInfoForSimSlotIndex]+ slotIndex="
                                 + slotIndex + " subId=" + si);
                     }
-                return conditionallyRemoveIdentifiers(si, callingPackage,
+                    return conditionallyRemoveIdentifiers(si, callingPackage,
                             "getActiveSubscriptionInfoForSimSlotIndex");
                 }
             }
-        if (DBG) {
+            if (DBG) {
                 logd("[getActiveSubscriptionInfoForSimSlotIndex]+ slotIndex=" + slotIndex
                         + " subId=null");
             }
@@ -678,7 +679,7 @@ public class SubscriptionController extends ISub.Stub {
                 logd("[getActiveSubscriptionInfoForSimSlotIndex]+ subList=null");
             }
         }
-        
+
 
         return null;
     }
@@ -691,6 +692,19 @@ public class SubscriptionController extends ISub.Stub {
      */
     @Override
     public List<SubscriptionInfo> getAllSubInfoList(String callingPackage) {
+        return getAllSubInfoList(callingPackage, false);
+    }
+
+    /**
+     * @param callingPackage The package making the IPC.
+     * @param callingFeatureId The feature in the package
+     * @param skipConditionallyRemoveIdentifier if set, skip removing identifier conditionally
+     * @return List of all SubscriptionInfo records in database,
+     * include those that were inserted before, maybe empty but not null.
+     * @hide
+     */
+    public List<SubscriptionInfo> getAllSubInfoList(String callingPackage,
+            boolean skipConditionallyRemoveIdentifier) {
         if (VDBG) logd("[getAllSubInfoList]+");
 
         // This API isn't public, so no need to provide a valid subscription ID - we're not worried
@@ -703,17 +717,27 @@ public class SubscriptionController extends ISub.Stub {
 
         // Now that all security checks passes, perform the operation as ourselves.
         final long identity = Binder.clearCallingIdentity();
+        List<SubscriptionInfo> subList;
         try {
-            List<SubscriptionInfo> subList = null;
             subList = getSubInfo(null, null);
-            if (subList != null) {
-                if (VDBG) logd("[getAllSubInfoList]- " + subList.size() + " infos return");
-            } else {
-                if (VDBG) logd("[getAllSubInfoList]- no info return");
-            }
-            return subList;
         } finally {
             Binder.restoreCallingIdentity(identity);
+        }
+        if (subList != null && !skipConditionallyRemoveIdentifier) {
+            if (VDBG) logd("[getAllSubInfoList]- " + subList.size() + " infos return");
+            subList = subList.stream().map(
+                    subscriptionInfo -> conditionallyRemoveIdentifiers(subscriptionInfo,
+                            callingPackage, "getAllSubInfoList"))
+                    .collect(Collectors.toList());
+        } else {
+            if (VDBG) logd("[getAllSubInfoList]- no info return");
+        }
+        return subList;
+    }
+
+    private List<SubscriptionInfo> makeCacheListCopyWithLock(List<SubscriptionInfo> cacheSubList) {
+        synchronized (mSubInfoListLock) {
+            return new ArrayList<>(cacheSubList);
         }
     }
 
@@ -726,7 +750,8 @@ public class SubscriptionController extends ISub.Stub {
     @UnsupportedAppUsage
     @Override
     public List<SubscriptionInfo> getActiveSubscriptionInfoList(String callingPackage) {
-        return getSubscriptionInfoListFromCacheHelper(callingPackage, mCacheActiveSubInfoList);
+        return getSubscriptionInfoListFromCacheHelper(callingPackage,
+                makeCacheListCopyWithLock(mCacheActiveSubInfoList));
     }
 
     /**
@@ -737,13 +762,13 @@ public class SubscriptionController extends ISub.Stub {
     public void refreshCachedActiveSubscriptionInfoList() {
         boolean opptSubListChanged;
 
-        synchronized (mSubInfoListLock) {
-            List<SubscriptionInfo> activeSubscriptionInfoList = getSubInfo(
-                    SubscriptionManager.SIM_SLOT_INDEX + ">=0 OR "
-                    + SubscriptionManager.SUBSCRIPTION_TYPE + "="
-                    + SubscriptionManager.SUBSCRIPTION_TYPE_REMOTE_SIM,
-                    null);
+        List<SubscriptionInfo> activeSubscriptionInfoList = getSubInfo(
+                SubscriptionManager.SIM_SLOT_INDEX + ">=0 OR "
+                + SubscriptionManager.SUBSCRIPTION_TYPE + "="
+                + SubscriptionManager.SUBSCRIPTION_TYPE_REMOTE_SIM,
+                null);
 
+        synchronized (mSubInfoListLock) {
             if (activeSubscriptionInfoList != null) {
                 // Log when active sub info changes.
                 if (mCacheActiveSubInfoList.size() != activeSubscriptionInfoList.size()
@@ -758,10 +783,6 @@ public class SubscriptionController extends ISub.Stub {
                 logd("activeSubscriptionInfoList is null.");
                 mCacheActiveSubInfoList.clear();
             }
-
-            // Refresh cached opportunistic sub list and detect whether it's changed.
-            refreshCachedOpportunisticSubscriptionInfoList();
-
             if (DBG_CACHE) {
                 if (!mCacheActiveSubInfoList.isEmpty()) {
                     for (SubscriptionInfo si : mCacheActiveSubInfoList) {
@@ -773,6 +794,9 @@ public class SubscriptionController extends ISub.Stub {
                 }
             }
         }
+
+        // Refresh cached opportunistic sub list and detect whether it's changed.
+        refreshCachedOpportunisticSubscriptionInfoList();
     }
 
     /**
@@ -845,12 +869,18 @@ public class SubscriptionController extends ISub.Stub {
 
     @Override
     public List<SubscriptionInfo> getAvailableSubscriptionInfoList(String callingPackage) {
-        // This API isn't public, so no need to provide a valid subscription ID - we're not worried
-        // about carrier-privileged callers not having access.
-        if (!TelephonyPermissions.checkCallingOrSelfReadPhoneState(
-                mContext, SubscriptionManager.INVALID_SUBSCRIPTION_ID, callingPackage,
-                "getAvailableSubscriptionInfoList")) {
-            throw new SecurityException("Need READ_PHONE_STATE to call "
+        try {
+            enforceReadPrivilegedPhoneState("getAvailableSubscriptionInfoList");
+        } catch (SecurityException e) {
+            try {
+                mContext.enforceCallingOrSelfPermission(Manifest.permission.READ_PHONE_STATE, null);
+                // If caller doesn't have READ_PRIVILEGED_PHONE_STATE permission but only
+                // has READ_PHONE_STATE permission, log this event.
+                EventLog.writeEvent(0x534e4554, "185235454", Binder.getCallingUid());
+            } catch (SecurityException ex) {
+                // Ignore
+            }
+            throw new SecurityException("Need READ_PRIVILEGED_PHONE_STATE to call "
                     + " getAvailableSubscriptionInfoList");
         }
 
@@ -1035,12 +1065,6 @@ public class SubscriptionController extends ISub.Stub {
     @Override
     public int addSubInfo(String uniqueId, String displayName, int slotIndex,
             int subscriptionType) {
-        String fullIccId = uniqueId;
-        Phone phone = PhoneFactory.getPhone(slotIndex);
-        if (phone != null) {
-            fullIccId = phone.getFullIccSerialNumber();
-        }
-
         if (DBG) {
             String iccIdStr = uniqueId;
             if (!isSubscriptionForRemoteSim(subscriptionType)) {
@@ -1068,9 +1092,8 @@ public class SubscriptionController extends ISub.Stub {
                 selection += " AND " + SubscriptionManager.SUBSCRIPTION_TYPE + "=?";
                 args = new String[]{uniqueId, Integer.toString(subscriptionType)};
             } else {
-                selection += " OR " + SubscriptionManager.ICC_ID + "=?"
-                    + " OR " + SubscriptionManager.ICC_ID + "=?" + " collate nocase";
-                args = new String[]{uniqueId, IccUtils.getDecimalSubstring(uniqueId), fullIccId};
+                selection += " OR " + SubscriptionManager.ICC_ID + "=?";
+                args = new String[]{uniqueId, IccUtils.getDecimalSubstring(uniqueId)};
             }
             Cursor cursor = resolver.query(SubscriptionManager.CONTENT_URI,
                     new String[]{SubscriptionManager.UNIQUE_KEY_SUBSCRIPTION_ID,
@@ -1108,9 +1131,8 @@ public class SubscriptionController extends ISub.Stub {
                             value.put(SubscriptionManager.SIM_SLOT_INDEX, slotIndex);
                         }
 
-                        if (oldIccId != null && oldIccId.length() != uniqueId.length()
-                                && (oldIccId.equals(IccUtils.getDecimalSubstring(uniqueId))
-                                        || uniqueId.equals(IccUtils.stripTrailingFs(oldIccId)))) {
+                        if (oldIccId != null && oldIccId.length() < uniqueId.length()
+                                && (oldIccId.equals(IccUtils.getDecimalSubstring(uniqueId)))) {
                             value.put(SubscriptionManager.ICC_ID, uniqueId);
                         }
 
@@ -2993,8 +3015,8 @@ public class SubscriptionController extends ISub.Stub {
 
     @Override
     public List<SubscriptionInfo> getOpportunisticSubscriptions(String callingPackage) {
-        return getSubscriptionInfoListFromCacheHelper(
-                callingPackage, mCacheOpportunisticSubInfoList);
+        return getSubscriptionInfoListFromCacheHelper(callingPackage,
+                makeCacheListCopyWithLock(mCacheOpportunisticSubInfoList));
     }
 
     /**
@@ -3348,7 +3370,9 @@ public class SubscriptionController extends ISub.Stub {
         List<SubscriptionInfo> subInfoList;
 
         try {
-            subInfoList = getAllSubInfoList(mContext.getOpPackageName());
+            // need to bypass removing identifier check because that will remove the subList without
+            // group id.
+            subInfoList = getAllSubInfoList(mContext.getOpPackageName(), true);
             if (groupUuid == null || subInfoList == null || subInfoList.isEmpty()) {
                 return new ArrayList<>();
             }
@@ -3363,7 +3387,7 @@ public class SubscriptionController extends ISub.Stub {
                     callingPackage, "getSubscriptionsInGroup")
                     || info.canManageSubscription(mContext, callingPackage);
         }).map(subscriptionInfo -> conditionallyRemoveIdentifiers(subscriptionInfo,
-                callingPackage, "getSubscriptionInfoList"))
+                callingPackage, "getSubscriptionsInGroup"))
         .collect(Collectors.toList());
     }
 
@@ -3631,45 +3655,57 @@ public class SubscriptionController extends ISub.Stub {
     // They are doing similar things except operating on different cache.
     private List<SubscriptionInfo> getSubscriptionInfoListFromCacheHelper(
             String callingPackage, List<SubscriptionInfo> cacheSubList) {
-        boolean canReadAllPhoneState;
+        boolean canReadPhoneState = false;
+        boolean canReadIdentifiers = false;
         try {
-            canReadAllPhoneState = TelephonyPermissions.checkReadPhoneState(mContext,
+            canReadPhoneState = TelephonyPermissions.checkReadPhoneState(mContext,
                     SubscriptionManager.INVALID_SUBSCRIPTION_ID, Binder.getCallingPid(),
                     Binder.getCallingUid(), callingPackage, "getSubscriptionInfoList");
             // If the calling package has the READ_PHONE_STATE permission then check if the caller
-            // also has access to subscriber identifiers to ensure that the ICC ID and any other
-            // unique identifiers are removed if the caller should not have access.
-            if (canReadAllPhoneState) {
-                canReadAllPhoneState = hasSubscriberIdentifierAccess(
+            // also has access to subscriber identifiers to ensure that the ICC
+            // ID and any other unique identifiers are removed if the caller should not have access.
+            if (canReadPhoneState) {
+                canReadIdentifiers = hasSubscriberIdentifierAccess(
                         SubscriptionManager.INVALID_SUBSCRIPTION_ID, callingPackage,
                         "getSubscriptionInfoList");
             }
         } catch (SecurityException e) {
-            canReadAllPhoneState = false;
+            // If a SecurityException is thrown during the READ_PHONE_STATE check then the only way
+            // to access a subscription is to have carrier privileges for its subId; an app with
+            // carrier privileges for a subscription is also granted access to all identifiers so
+            // the identifier and phone number access checks are not required.
         }
 
-        synchronized (mSubInfoListLock) {
-            // If the caller can read all phone state, just return the full list.
-            if (canReadAllPhoneState) {
-                return new ArrayList<>(cacheSubList);
+        // If the caller can read all phone state, just return the full list.
+        if (canReadIdentifiers) {
+            return cacheSubList;
+        }
+        // Filter the list to only include subscriptions which the caller can manage.
+        List<SubscriptionInfo> subscriptions = new ArrayList<>(cacheSubList.size());
+        for (SubscriptionInfo subscriptionInfo : cacheSubList) {
+            int subId = subscriptionInfo.getSubscriptionId();
+            boolean hasCarrierPrivileges = TelephonyPermissions.checkCarrierPrivilegeForSubId(
+                    subId);
+            // If the caller does not have the READ_PHONE_STATE permission nor carrier
+            // privileges then they cannot access the current subscription.
+            if (!canReadPhoneState && !hasCarrierPrivileges) {
+                continue;
             }
-
-            // Filter the list to only include subscriptions which the caller can manage.
-            return cacheSubList.stream()
-                    .filter(subscriptionInfo -> {
-                        try {
-                            return TelephonyPermissions.checkCallingOrSelfReadPhoneState(mContext,
-                                    subscriptionInfo.getSubscriptionId(), callingPackage,
-                                    "getSubscriptionInfoList");
-                        } catch (SecurityException e) {
-                            return false;
-                        }
-                    }).map(subscriptionInfo -> conditionallyRemoveIdentifiers(subscriptionInfo,
-                            callingPackage, "getSubscriptionInfoList"))
-                    .collect(Collectors.toList());
+            // If the caller has carrier privileges then they are granted access to all
+            // identifiers for their subscription.
+            if (hasCarrierPrivileges) {
+                subscriptions.add(subscriptionInfo);
+            } else {
+                // The caller does not have carrier privileges for this subId, filter the
+                // identifiers in the subscription based on the results of the initial
+                // permission checks.
+                subscriptions.add(
+                        conditionallyRemoveIdentifiers(subscriptionInfo, canReadIdentifiers));
+            }
         }
+        return subscriptions;
     }
-    
+
     /**
      * Conditionally removes identifiers from the provided {@code subInfo} if the {@code
      * callingPackage} does not meet the access requirements for identifiers and returns the
@@ -3682,9 +3718,29 @@ public class SubscriptionController extends ISub.Stub {
     private SubscriptionInfo conditionallyRemoveIdentifiers(SubscriptionInfo subInfo,
             String callingPackage,  String message) {
         SubscriptionInfo result = subInfo;
-        if (!hasSubscriberIdentifierAccess(subInfo.getSubscriptionId(), callingPackage, message)) {
-            result = new SubscriptionInfo(subInfo);
+        int subId = subInfo.getSubscriptionId();
+        boolean hasIdentifierAccess = hasSubscriberIdentifierAccess(subId, callingPackage, message);
+        return conditionallyRemoveIdentifiers(subInfo, hasIdentifierAccess);
+    }
+
+    /**
+     * Conditionally removes identifiers from the provided {@code subInfo} based on if the calling
+     * package {@code hasIdentifierAccess} and returns the potentially modified object.
+     *
+     * <p>If the caller specifies the package does not have identifier access
+     * a clone of the provided SubscriptionInfo is created and modified to avoid altering
+     * SubscriptionInfo objects in a cache.
+     */
+    private SubscriptionInfo conditionallyRemoveIdentifiers(SubscriptionInfo subInfo,
+            boolean hasIdentifierAccess) {
+        if (hasIdentifierAccess) {
+            return subInfo;
+        }
+        SubscriptionInfo result = new SubscriptionInfo(subInfo);
+        if (!hasIdentifierAccess) {
             result.clearIccId();
+            result.clearCardString();
+            result.clearGroupUuid();
         }
         return result;
     }
@@ -3748,13 +3804,12 @@ public class SubscriptionController extends ISub.Stub {
     }
 
     private void refreshCachedOpportunisticSubscriptionInfoList() {
+        List<SubscriptionInfo> subList = getSubInfo(
+                SubscriptionManager.IS_OPPORTUNISTIC + "=1 AND ("
+                        + SubscriptionManager.SIM_SLOT_INDEX + ">=0 OR "
+                        + SubscriptionManager.IS_EMBEDDED + "=1)", null);
         synchronized (mSubInfoListLock) {
             List<SubscriptionInfo> oldOpptCachedList = mCacheOpportunisticSubInfoList;
-
-            List<SubscriptionInfo> subList = getSubInfo(
-                    SubscriptionManager.IS_OPPORTUNISTIC + "=1 AND ("
-                            + SubscriptionManager.SIM_SLOT_INDEX + ">=0 OR "
-                            + SubscriptionManager.IS_EMBEDDED + "=1)", null);
 
             if (subList != null) {
                 subList.sort(SUBSCRIPTION_INFO_COMPARATOR);
